@@ -25,13 +25,13 @@ const client = new Client({
 const TOKEN = process.env.TOKEN;
 const ASSIST_CHANNELS = process.env.ASSIST_CHANNELS.split(',');
 
-// simple database
+// database
 let data = {};
 if (fs.existsSync('data.json')) {
   data = JSON.parse(fs.readFileSync('data.json'));
 }
 
-// create buttons
+// buttons
 const row = new ActionRowBuilder().addComponents(
   new ButtonBuilder()
     .setCustomId('in')
@@ -43,13 +43,14 @@ const row = new ActionRowBuilder().addComponents(
     .setStyle(ButtonStyle.Danger)
 );
 
-// Panel, leaderboard, and resetpoints commands
+// COMMANDS
 client.on('messageCreate', async (msg) => {
   if (!msg.guild) return;
 
-  // Panel command
+  // PANEL
   if (msg.content === '!panel') {
     const file = new AttachmentBuilder('./assets/design.gif');
+
     const embed = new EmbedBuilder()
       .setColor(0x0099FF)
       .setTitle("Fury Management System")
@@ -64,7 +65,7 @@ client.on('messageCreate', async (msg) => {
     });
   }
 
-  // Leaderboard command
+  // LEADERBOARD
   if (msg.content === '!leaderboard') {
     const sorted = Object.entries(data)
       .sort((a, b) => b[1].total - a[1].total);
@@ -91,10 +92,10 @@ client.on('messageCreate', async (msg) => {
     msg.channel.send({ embeds: [embed] });
   }
 
-  // Reset points command
+  // RESET
   if (msg.content === '!resetpoints') {
     for (const userId in data) {
-      data[userId].total = 0; // reset points
+      data[userId].total = 0;
     }
 
     fs.writeFileSync('data.json', JSON.stringify(data, null, 2));
@@ -110,7 +111,7 @@ client.on('messageCreate', async (msg) => {
   }
 });
 
-// Button handler
+// BUTTON HANDLER
 client.on(Events.InteractionCreate, async interaction => {
   if (!interaction.isButton()) return;
 
@@ -127,67 +128,144 @@ client.on(Events.InteractionCreate, async interaction => {
     if (!inAssist) {
       return interaction.reply({ content: '❌ You must be in an assist voice channel!', ephemeral: true });
     }
+
     data[userId].active = true;
     data[userId].lastClick = Date.now();
+
     interaction.reply({ content: '✅ Timer started!', ephemeral: true });
   }
 
   if (interaction.customId === 'out') {
     data[userId].active = false;
     data[userId].lastClick = 0;
+
     interaction.reply({ content: '⛔ Timer stopped!', ephemeral: true });
   }
 
   fs.writeFileSync('data.json', JSON.stringify(data, null, 2));
 });
 
-// Timer loop (5 minutes = 1 point)
-setInterval(() => {
+// TIMER LOOP (ANTI-CHEAT INCLUDED)
+setInterval(async () => {
   const now = Date.now();
 
   for (const userId in data) {
     const user = data[userId];
     if (!user.active) continue;
 
-    // auto stop after 30 min inactivity
-    if (now - user.lastClick > 30 * 60 * 1000) {
+    let member = null;
+
+    for (const guild of client.guilds.cache.values()) {
+      const m = guild.members.cache.get(userId);
+      if (m) {
+        member = m;
+        break;
+      }
+    }
+
+    // Not in VC
+    if (!member || !member.voice.channelId) {
       user.active = false;
+      user.lastClick = 0;
       continue;
     }
 
-    user.total += 1; // 1 point per 5 minutes
+    const inAssist = ASSIST_CHANNELS.includes(member.voice.channelId);
+
+    // Not in assist VC
+    if (!inAssist) {
+      user.active = false;
+      user.lastClick = 0;
+      continue;
+    }
+
+    // 🚫 Anti-cheat (ONLY deafened)
+    if (member.voice.selfDeaf) {
+      user.active = false;
+      user.lastClick = 0;
+
+      try {
+        const userObj = await client.users.fetch(userId);
+        await userObj.send({
+          embeds: [
+            new EmbedBuilder()
+              .setColor(0xFF0000)
+              .setTitle('🚫 Anti-Cheat Triggered')
+              .setDescription('You were deafened.\nTimer has been stopped.')
+              .setTimestamp()
+          ]
+        });
+      } catch (err) {
+        console.log(`DM failed: ${userId}`);
+      }
+
+      continue;
+    }
+
+    // ⏰ 30 MIN TIMEOUT
+    if (now - user.lastClick > 30 * 60 * 1000) {
+      user.active = false;
+      user.lastClick = 0;
+
+      try {
+        const userObj = await client.users.fetch(userId);
+        await userObj.send({
+          embeds: [
+            new EmbedBuilder()
+              .setColor(0xFF0000)
+              .setTitle('⛔ Timer Stopped')
+              .setDescription('You did not click (IN) within 30 minutes.\nTimer stopped.')
+              .setTimestamp()
+          ]
+        });
+      } catch (err) {
+        console.log(`DM failed: ${userId}`);
+      }
+
+      continue;
+    }
+
+    // ✅ GIVE POINT
+    user.total += 1;
   }
 
   fs.writeFileSync('data.json', JSON.stringify(data, null, 2));
-}, 5 * 60 * 1000); // every 5 minutes
+}, 5 * 60 * 1000);
 
-// Startup event
+// READY
 client.once('ready', () => {
   console.log(`${client.user.tag} is online!`);
-  // No startup embed sent anymore
 });
 
-// Auto-stop timer if user leaves assist channel
+// AUTO STOP IF LEAVE VC
 client.on('voiceStateUpdate', async (oldState, newState) => {
   if (oldState.member.user.bot) return;
 
   const userId = oldState.member.id;
-  const leftAssistChannel =
+
+  const leftAssist =
     oldState.channelId &&
     ASSIST_CHANNELS.includes(oldState.channelId) &&
     (!newState.channelId || !ASSIST_CHANNELS.includes(newState.channelId));
 
-  if (leftAssistChannel && data[userId] && data[userId].active) {
+  if (leftAssist && data[userId] && data[userId].active) {
     data[userId].active = false;
     data[userId].lastClick = 0;
 
     fs.writeFileSync('data.json', JSON.stringify(data, null, 2));
-    console.log(`⛔ Auto-stopped timer for ${oldState.member.user.tag}`);
 
     try {
-      await oldState.member.send('⛔ Your timer has been stopped because you left the assist voice channel.');
+      await oldState.member.send({
+        embeds: [
+          new EmbedBuilder()
+            .setColor(0xFF0000)
+            .setTitle('⛔ Timer Stopped')
+            .setDescription('You left the assist voice channel.\nTimer stopped.')
+            .setTimestamp()
+        ]
+      });
     } catch (err) {
-      console.log(`Failed to send DM to ${oldState.member.user.tag}:`, err);
+      console.log(`DM failed`);
     }
   }
 });
